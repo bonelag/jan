@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::io::Write;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use console::Style;
@@ -57,6 +58,12 @@ enum Commands {
     /// Load a local model and expose it at localhost:6767/v1 (auto-detects LlamaCPP or MLX)
     #[command(display_order = 1)]
     Serve {
+        #[command(flatten)]
+        args: ServeArgs,
+    },
+    /// Load a local model and chat with it in a beautiful Terminal UI
+    #[command(display_order = 3)]
+    Tui {
         #[command(flatten)]
         args: ServeArgs,
     },
@@ -290,6 +297,7 @@ async fn main() {
         Commands::Threads { cmd } => handle_threads(cmd).await,
         Commands::Models { cmd } => handle_models(cmd).await,
         Commands::Serve { args } => handle_serve(args).await,
+        Commands::Tui { args } => handle_tui(args).await,
         Commands::Launch { program, program_args, model, bin, port, api_key, n_gpu_layers, ctx_size, fit, verbose, select } => {
             let program = program.unwrap_or_else(select_program_interactively);
             let ctx_size_val = ctx_size.unwrap_or(32768);
@@ -1021,11 +1029,7 @@ async fn ensure_router_and_load(
 
     let already_running = { llama_state.router.lock().await.is_some() };
     if !already_running {
-        let router_api_key = if api_key.is_empty() {
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            api_key.clone()
-        };
+        let router_api_key = api_key.clone();
         let mut router_envs = envs.clone();
         router_envs
             .entry("LLAMA_ARG_TIMEOUT".to_string())
@@ -1055,10 +1059,15 @@ async fn ensure_router_and_load(
         (h.port, h.api_key.clone(), h.pid)
     };
 
+    #[cfg(windows)]
+    win_job::assign_process_to_kill_on_close_job(router_pid);
+
     let url = format!("http://127.0.0.1:{router_port}/models/load");
-    let resp = reqwest::Client::new()
-        .post(&url)
-        .header("Authorization", format!("Bearer {router_key}"))
+    let mut req = reqwest::Client::new().post(&url);
+    if !router_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {router_key}"));
+    }
+    let resp = req
         .json(&serde_json::json!({ "model": model_id }))
         .send()
         .await
@@ -1146,7 +1155,7 @@ async fn handle_launch(
     let effective_fit = fit.unwrap_or(is_claude && ctx_size_is_default);
 
     // Start the model server inline (same process, no detach).
-    let (pid, actual_port) = start_model_server(&model_id, bin, port, api_key.clone(), n_gpu_layers, ctx_size, effective_fit, verbose).await;
+    let (pid, actual_port, actual_api_key, _server_state) = start_model_server(&model_id, bin, port, api_key.clone(), n_gpu_layers, ctx_size, effective_fit, verbose).await;
 
     // Model is ready — silence server request/response logs so they don't
     // flood the launched program's terminal (e.g. Claude Code's shell).
@@ -1161,7 +1170,7 @@ async fn handle_launch(
     // Write the jan provider entry and set the default model, then launch `openclaw tui`.
     let mut program_args = program_args;
     if is_openclaw {
-        configure_openclaw(&v1_url, &api_key, &model_id);
+        configure_openclaw(&v1_url, &actual_api_key, &model_id);
         // openclaw's TUI is a sub-command; prepend it unless the caller already did
         if program_args.first().map(|s| s.as_str()) != Some("tui") {
             program_args.insert(0, "tui".to_string());
@@ -1173,10 +1182,10 @@ async fn handle_launch(
         let anthropic_key_var = if is_claude { "ANTHROPIC_AUTH_TOKEN" } else { "ANTHROPIC_API_KEY" };
         eprintln!();
         eprintln!("  OPENAI_BASE_URL={v1_url}");
-        eprintln!("  OPENAI_API_KEY={api_key}");
+        eprintln!("  OPENAI_API_KEY={actual_api_key}");
         eprintln!("  OPENAI_MODEL={model_id}");
         eprintln!("  ANTHROPIC_BASE_URL={base_url}");
-        eprintln!("  {anthropic_key_var}={api_key}");
+        eprintln!("  {anthropic_key_var}={actual_api_key}");
         eprintln!("  ANTHROPIC_DEFAULT_OPUS_MODEL={model_id}");
         eprintln!("  ANTHROPIC_DEFAULT_SONNET_MODEL={model_id}");
         eprintln!("  ANTHROPIC_DEFAULT_HAIKU_MODEL={model_id}");
@@ -1218,10 +1227,10 @@ async fn handle_launch(
     } else {
         let anthropic_key_var = if is_claude { "ANTHROPIC_AUTH_TOKEN" } else { "ANTHROPIC_API_KEY" };
         cmd.env("OPENAI_BASE_URL", &v1_url)
-            .env("OPENAI_API_KEY",  &api_key)
+            .env("OPENAI_API_KEY",  &actual_api_key)
             .env("OPENAI_MODEL",    &model_id)
             .env("ANTHROPIC_BASE_URL", &base_url)
-            .env(anthropic_key_var,    &api_key)
+            .env(anthropic_key_var,    &actual_api_key)
             .env("ANTHROPIC_DEFAULT_OPUS_MODEL",   &model_id)
             .env("ANTHROPIC_DEFAULT_SONNET_MODEL", &model_id)
             .env("ANTHROPIC_DEFAULT_HAIKU_MODEL",  &model_id);
@@ -1299,7 +1308,14 @@ fn configure_openclaw(v1_url: &str, api_key: &str, model_id: &str) {
     }
 }
 
-/// Start the model server and return `(pid, actual_port)`.
+#[allow(dead_code)]
+enum ActiveServerState {
+    Llama(Arc<LlamacppState>),
+    #[cfg(target_os = "macos")]
+    Mlx(Arc<tauri_plugin_mlx::state::MlxState>),
+}
+
+/// Start the model server and return `(pid, actual_port, api_key, state)`.
 /// Resolves the engine automatically (LlamaCPP or MLX).
 #[allow(clippy::too_many_arguments)]
 async fn start_model_server(
@@ -1311,7 +1327,7 @@ async fn start_model_server(
     ctx_size: i32,
     fit: bool,
     verbose: bool,
-) -> (i32, u16) {
+) -> (i32, u16, String, ActiveServerState) {
     let (engine, model_path, mmproj) = match resolve_model_engine(model_id) {
         Ok(r) => r,
         Err(_) if looks_like_hf_repo(model_id) => {
@@ -1369,7 +1385,7 @@ async fn start_model_server(
         };
         let url = format!("http://127.0.0.1:{}", info.port);
         finish_progress(pb, format!("✓ {model_id} ready · {url}"));
-        (info.pid, info.port as u16)
+        (info.pid, info.port as u16, api_key.clone(), ActiveServerState::Mlx(mlx_state))
         }
     } else {
         let bin_path = match bin.or_else(|| discover_llamacpp_binary().map(|p| p.to_string_lossy().into_owned())) {
@@ -1402,7 +1418,781 @@ async fn start_model_server(
         };
         let url = format!("http://127.0.0.1:{}", info.port);
         finish_progress(pb, format!("✓ {model_id} ready · {url}"));
-        (info.pid, info.port)
+        (info.pid, info.port, info.api_key, ActiveServerState::Llama(llama_state))
+    }
+}
+
+// ── TUI Chat Implementation ──────────────────────────────────────────────────
+
+struct TuiRenderer {
+    in_code_block: bool,
+    in_inline_code: bool,
+    in_bold: bool,
+    is_line_start: bool,
+    header_level: usize,
+    buffering_lang: bool,
+    lang_buffer: String,
+    buffer: Vec<char>,
+}
+
+impl TuiRenderer {
+    fn new() -> Self {
+        Self {
+            in_code_block: false,
+            in_inline_code: false,
+            in_bold: false,
+            is_line_start: true,
+            header_level: 0,
+            buffering_lang: false,
+            lang_buffer: String::new(),
+            buffer: Vec::new(),
+        }
+    }
+
+    fn render_chunk(&mut self, chunk: &str) {
+        self.buffer.extend(chunk.chars());
+        self.process_buffer(false);
+    }
+
+    fn process_buffer(&mut self, is_final: bool) {
+        use console::Style;
+        let mut i = 0;
+        while i < self.buffer.len() {
+            // Check if we have a backtick
+            if self.buffer[i] == '`' {
+                // Lookahead check for code block ```
+                if i + 2 < self.buffer.len() {
+                    if self.buffer[i+1] == '`' && self.buffer[i+2] == '`' {
+                        self.in_code_block = !self.in_code_block;
+                        i += 3;
+                        
+                        // Clear inline styles
+                        self.in_inline_code = false;
+                        self.in_bold = false;
+                        
+                        if self.in_code_block {
+                            self.buffering_lang = true;
+                            self.lang_buffer.clear();
+                        } else {
+                            print!("\n{}", Style::new().cyan().bold().apply_to("------------------------\n"));
+                            self.is_line_start = true;
+                            std::io::stdout().flush().ok();
+                        }
+                        continue;
+                    }
+                } else if !is_final {
+                    // Not enough characters to determine if it is ``` or `
+                    // Wait for next chunk
+                    break;
+                }
+                
+                // Lookahead check for single backtick (inline code)
+                if i + 1 < self.buffer.len() {
+                    if self.buffer[i+1] != '`' {
+                        self.in_inline_code = !self.in_inline_code;
+                        i += 1;
+                        continue;
+                    }
+                } else if is_final {
+                    // Only 1 backtick left at the end of stream, must be inline code toggle
+                    self.in_inline_code = !self.in_inline_code;
+                    i += 1;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            
+            // Check if we have an asterisk
+            if self.buffer[i] == '*' {
+                // Lookahead check for bold **
+                if i + 1 < self.buffer.len() {
+                    if self.buffer[i+1] == '*' {
+                        self.in_bold = !self.in_bold;
+                        i += 2;
+                        continue;
+                    }
+                } else if !is_final {
+                    // Not enough characters to determine if it is * or **
+                    break;
+                }
+            }
+
+            if self.in_code_block {
+                let c = self.buffer[i];
+                i += 1;
+                
+                if self.buffering_lang {
+                    if c == '\n' {
+                        self.buffering_lang = false;
+                        let lang = self.lang_buffer.trim();
+                        if lang.is_empty() {
+                            print!("\n{}", Style::new().cyan().bold().apply_to("------[code]---------\n"));
+                        } else {
+                            print!("\n{}", Style::new().cyan().bold().apply_to(format!("------[code - {}]---------\n", lang)));
+                        }
+                    } else {
+                        self.lang_buffer.push(c);
+                    }
+                    std::io::stdout().flush().ok();
+                    continue;
+                }
+
+                // Render character inside code block directly in cyan
+                print!("{}", Style::new().cyan().apply_to(c));
+                std::io::stdout().flush().ok();
+                continue;
+            }
+
+            let c = self.buffer[i];
+            
+            if c == '\n' {
+                i += 1;
+                self.is_line_start = true;
+                self.header_level = 0;
+                print!("\n");
+                std::io::stdout().flush().ok();
+                continue;
+            }
+
+            if self.is_line_start {
+                if c == ' ' || c == '\t' {
+                    i += 1;
+                    print!("{}", c);
+                    std::io::stdout().flush().ok();
+                    continue;
+                }
+
+                // Detect lists: - or * followed by a space
+                if c == '-' || c == '*' {
+                    if i + 1 < self.buffer.len() {
+                        if self.buffer[i+1] == ' ' {
+                            i += 2; // consume delimiter and space
+                            print!(" {} ", Style::new().magenta().apply_to("•"));
+                            self.is_line_start = false;
+                            std::io::stdout().flush().ok();
+                            continue;
+                        }
+                    } else if !is_final {
+                        // End of buffer, wait
+                        break;
+                    }
+                }
+
+                // Detect thematic break ---
+                if c == '-' {
+                    let mut dash_count = 0;
+                    while i + dash_count < self.buffer.len() && self.buffer[i + dash_count] == '-' {
+                        dash_count += 1;
+                    }
+                    if dash_count >= 3 {
+                        if i + dash_count < self.buffer.len() {
+                            let next_char = self.buffer[i + dash_count];
+                            if next_char == '\n' || next_char == ' ' {
+                                i += dash_count;
+                                if next_char == ' ' {
+                                    i += 1; // consume space
+                                }
+                                print!("{}", Style::new().cyan().bold().apply_to("━".repeat(60)));
+                                self.is_line_start = false;
+                                std::io::stdout().flush().ok();
+                                continue;
+                            }
+                        } else if is_final {
+                            i += dash_count;
+                            print!("{}", Style::new().cyan().bold().apply_to("━".repeat(60)));
+                            self.is_line_start = false;
+                            std::io::stdout().flush().ok();
+                            continue;
+                        } else {
+                            // End of buffer, wait
+                            break;
+                        }
+                    } else {
+                        if i + dash_count >= self.buffer.len() {
+                            if !is_final {
+                                // Could become 3 dashes in next chunk, wait
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Detect headers: #, ##, etc.
+                if c == '#' {
+                    let mut hash_count = 0;
+                    while i + hash_count < self.buffer.len() && self.buffer[i + hash_count] == '#' {
+                        hash_count += 1;
+                    }
+                    if i + hash_count < self.buffer.len() {
+                        if self.buffer[i + hash_count] == ' ' {
+                            self.header_level = hash_count;
+                            i += hash_count + 1; // consume hashes and space
+                            self.is_line_start = false;
+                            continue;
+                        }
+                    } else if !is_final {
+                        // End of buffer, wait
+                        break;
+                    }
+                }
+            }
+
+            // If we got here, we consume c as a normal styled character
+            i += 1;
+            self.is_line_start = false;
+
+            // Apply styles to the character
+            let mut style = Style::new();
+            if self.header_level > 0 {
+                style = match self.header_level {
+                    1 => Style::new().magenta().bold().underlined(),
+                    2 => Style::new().blue().bold(),
+                    _ => Style::new().yellow().bold(),
+                };
+            } else {
+                if self.in_bold {
+                    style = style.bold().yellow();
+                }
+                if self.in_inline_code {
+                    style = style.green();
+                }
+            }
+            print!("{}", style.apply_to(c));
+            std::io::stdout().flush().ok();
+        }
+
+        // Drain processed characters
+        self.buffer.drain(..i);
+    }
+
+    fn finish(&mut self) {
+        use console::Style;
+        self.process_buffer(true);
+        if self.in_code_block {
+            print!("\n{}", Style::new().cyan().bold().apply_to("----------------------------\n"));
+            self.in_code_block = false;
+        }
+        // Flush remaining buffer character by character (should be empty but just in case)
+        while !self.buffer.is_empty() {
+            let c = self.buffer.remove(0);
+            if c == '\n' {
+                print!("\n");
+            } else {
+                let mut style = Style::new();
+                if self.in_bold {
+                    style = style.bold().yellow();
+                }
+                if self.in_inline_code {
+                    style = style.green();
+                }
+                print!("{}", style.apply_to(c));
+            }
+        }
+        print!("\n");
+        std::io::stdout().flush().ok();
+    }
+}
+
+async fn handle_tui(args: ServeArgs) {
+    // 1. Resolve model ID just like serve does
+    let model_id = match args.model_id.as_deref() {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => {
+            if let Some(ref path) = args.model_path {
+                PathBuf::from(path)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "model".to_string())
+            } else {
+                select_model_interactively(args.select).await
+            }
+        }
+    };
+
+    let ServeArgs {
+        model_id: _,
+        model_path: _,
+        bin,
+        port,
+        mmproj: _,
+        embedding: _,
+        timeout: _,
+        n_gpu_layers,
+        ctx_size: ctx_size_arg,
+        threads: _,
+        api_key,
+        fit,
+        detach: _,
+        log: _,
+        verbose,
+        select: _,
+    } = args;
+
+    // Use fit to auto-adjust context size if desired, otherwise default
+    let effective_fit = fit;
+    let ctx_size = if fit { 0 } else { ctx_size_arg };
+
+    // Start model server
+    let (pid, actual_port, actual_api_key, _server_state) = start_model_server(
+        &model_id,
+        bin,
+        port,
+        api_key.clone(),
+        n_gpu_layers,
+        ctx_size,
+        effective_fit,
+        verbose,
+    )
+    .await;
+
+    // Set console level to warn if verbose is enabled, to keep terminal clean
+    if verbose {
+        log::set_max_level(log::LevelFilter::Warn);
+    }
+
+    // Clear terminal screen and show a beautiful greeting
+    print!("{}[2J{}[1;1H", 27 as char, 27 as char);
+    std::io::stdout().flush().ok();
+
+    let logo = make_logo();
+    println!("{}", logo);
+    
+    let border_style = Style::new().cyan().bold();
+    let text_style = Style::new().white().bold();
+    let italic_style = Style::new().italic().dim();
+    
+    println!("  {}", border_style.apply_to("╭──────────────────────────────────────────────────────────╮"));
+    println!("  {} {} {}", border_style.apply_to("│"), text_style.apply_to("                  JAN TERMINAL CHAT                     "), border_style.apply_to("│"));
+    println!("  {} {} {}", border_style.apply_to("│"), italic_style.apply_to("  Local AI Chat · Offline & Private · OpenAI compatible "), border_style.apply_to("│"));
+    println!("  {}", border_style.apply_to("╰──────────────────────────────────────────────────────────╯"));
+    println!();
+    println!("  Model loaded: {}", Style::new().green().bold().apply_to(&model_id));
+    println!("  API Port:     {}", Style::new().magenta().bold().apply_to(actual_port));
+    println!();
+    println!("  Type your messages below. Press Enter to send.");
+    println!("  Special commands:");
+    println!("    {} or {}  - Exit chat and shut down server", Style::new().yellow().apply_to("/exit"), Style::new().yellow().apply_to("/quit"));
+    println!("    {}            - Clear chat history", Style::new().yellow().apply_to("/clear"));
+    println!("    {}             - Show this help message", Style::new().yellow().apply_to("/help"));
+    println!("  {}", border_style.apply_to("━".repeat(60)));
+    println!();
+
+    let mut history: Vec<serde_json::Value> = Vec::new();
+    let client = reqwest::Client::new();
+
+    loop {
+        // Read user input. On Windows, support Shift+Enter for newlines and Enter to submit.
+        let input;
+        #[cfg(windows)]
+        let got_input = if console::user_attended() {
+            print!("{}", Style::new().green().bold().apply_to("You ❯ "));
+            std::io::stdout().flush().ok();
+            read_multiline_input()
+        } else {
+            None
+        };
+        
+        #[cfg(windows)]
+        if let Some(inp) = got_input {
+            input = inp;
+        } else {
+            // Fallback for non-TTY / piped or other platforms
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_ok() {
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    break;
+                }
+                input = trimmed;
+                if !console::user_attended() {
+                    println!("You ❯ {}", input);
+                }
+            } else {
+                break;
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            let input_result = dialoguer::Input::<String>::new()
+                .with_prompt(format!("{}", Style::new().green().bold().apply_to("You ❯")))
+                .interact_text();
+
+            match input_result {
+                Ok(inp) => input = inp.trim().to_string(),
+                Err(_) => {
+                    // Fallback for non-TTY / piped environments
+                    let mut line = String::new();
+                    if std::io::stdin().read_line(&mut line).is_ok() {
+                        let trimmed = line.trim().to_string();
+                        if trimmed.is_empty() {
+                            break;
+                        }
+                        input = trimmed;
+                        // Print input for visibility in piped tests
+                        println!("You ❯ {}", input);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if input.is_empty() {
+            continue;
+        }
+
+        if input == "/exit" || input == "/quit" {
+            break;
+        }
+
+        if input == "/clear" {
+            history.clear();
+            println!("\n  {} Conversation history cleared.\n", Style::new().yellow().apply_to("✓"));
+            continue;
+        }
+
+        if input == "/help" {
+            println!();
+            println!("  Commands:");
+            println!("    /exit, /quit - Exit the chat");
+            println!("    /clear       - Clear conversation history");
+            println!("    /help        - Show this help");
+            println!();
+            continue;
+        }
+
+        // Add user message to history
+        history.push(serde_json::json!({
+            "role": "user",
+            "content": input,
+        }));
+
+        // Send request to completions endpoint
+        let endpoint = format!("http://127.0.0.1:{}/v1/chat/completions", actual_port);
+        let request_payload = serde_json::json!({
+            "model": model_id,
+            "messages": history,
+            "stream": true,
+        });
+
+        // Show a temporary loading indicator
+        print!("\n");
+        let assistant_label = Style::new().magenta().bold().apply_to("Jan ❯ ");
+        print!("{}", assistant_label);
+        std::io::stdout().flush().ok();
+
+        let mut req = client.post(&endpoint);
+        if !actual_api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", actual_api_key));
+        }
+        let response_result = req
+            .json(&request_payload)
+            .send()
+            .await;
+
+        let response = match response_result {
+            Ok(resp) => resp,
+            Err(e) => {
+                println!("{}", Style::new().red().apply_to(format!("[Request failed: {}]", e)));
+                println!();
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            println!("{}", Style::new().red().apply_to(format!("[API Error ({}): {}]", status, text)));
+            println!();
+            continue;
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut buffer = Vec::new();
+        let mut assistant_response_text = String::new();
+        let mut renderer = TuiRenderer::new();
+
+        use futures::StreamExt;
+        
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = match chunk_res {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("\n{}", Style::new().red().apply_to(format!("[Stream error: {}]", e)));
+                    break;
+                }
+            };
+            buffer.extend_from_slice(&chunk);
+
+            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buffer.drain(..pos + 1).collect();
+                let line = String::from_utf8_lossy(&line_bytes);
+                let trimmed = line.trim();
+
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                if trimmed.starts_with("data: ") {
+                    let data_str = &trimmed[6..];
+                    if data_str == "[DONE]" {
+                        break;
+                    }
+
+                    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(data_str) {
+                        if let Some(choices) = json_val["choices"].as_array() {
+                            if let Some(first_choice) = choices.first() {
+                                if let Some(delta_content) = first_choice["delta"]["content"].as_str() {
+                                    assistant_response_text.push_str(delta_content);
+                                    renderer.render_chunk(delta_content);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Process any leftover bytes in the stream buffer that didn't end with a newline
+        if !buffer.is_empty() {
+            let line = String::from_utf8_lossy(&buffer);
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && trimmed.starts_with("data: ") {
+                let data_str = &trimmed[6..];
+                if data_str != "[DONE]" {
+                    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(data_str) {
+                        if let Some(choices) = json_val["choices"].as_array() {
+                            if let Some(first_choice) = choices.first() {
+                                if let Some(delta_content) = first_choice["delta"]["content"].as_str() {
+                                    assistant_response_text.push_str(delta_content);
+                                    renderer.render_chunk(delta_content);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            buffer.clear();
+        }
+
+        renderer.finish();
+        println!();
+
+        // Save assistant response to history
+        if !assistant_response_text.is_empty() {
+            history.push(serde_json::json!({
+                "role": "assistant",
+                "content": assistant_response_text,
+            }));
+        }
+    }
+
+    println!("\nShutting down model server...");
+    kill_process(pid);
+}
+
+#[cfg(windows)]
+fn read_multiline_input() -> Option<String> {
+    use std::io::Write;
+    unsafe {
+        let h_in = win_job::GetStdHandle(win_job::STD_INPUT_HANDLE);
+        if h_in == std::ptr::null_mut() {
+            return None;
+        }
+
+        let mut original_mode = 0;
+        if win_job::GetConsoleMode(h_in, &mut original_mode) == 0 {
+            return None;
+        }
+
+        // Enable raw input mode (disable line input and echo input)
+        // We keep processed input so Ctrl+C is still handled or we catch it
+        let raw_mode = (original_mode & !0x0002 & !0x0004) | 0x0001;
+        if win_job::SetConsoleMode(h_in, raw_mode) == 0 {
+            return None;
+        }
+
+        let mut input = String::new();
+        let mut stdout = std::io::stdout();
+
+        loop {
+            let mut record = std::mem::zeroed::<win_job::INPUT_RECORD>();
+            let mut read = 0;
+            if win_job::ReadConsoleInputW(h_in, &mut record, 1, &mut read) == 0 || read == 0 {
+                break;
+            }
+
+            if record.event_type == 1 && record.key_event.b_key_down != 0 {
+                let key_code = record.key_event.w_virtual_key_code;
+                let unicode_char = record.key_event.u_char;
+                let control_state = record.key_event.dw_control_key_state;
+
+                // SHIFT_PRESSED: 0x0010
+                let is_shift = (control_state & 0x0010) != 0;
+
+                if key_code == 0x0D { // Enter
+                    if is_shift {
+                        input.push('\n');
+                        print!("\n");
+                        stdout.flush().ok();
+                    } else {
+                        print!("\n");
+                        stdout.flush().ok();
+                        break;
+                    }
+                } else if key_code == 0x08 { // Backspace
+                    if !input.is_empty() {
+                        let popped = input.pop();
+                        if popped == Some('\n') {
+                            print!("\x1b[A\x1b[999C");
+                            stdout.flush().ok();
+                        } else {
+                            print!("\u{0008} \u{0008}");
+                            stdout.flush().ok();
+                        }
+                    }
+                } else if unicode_char != 0 {
+                    if let Some(c) = char::from_u32(unicode_char as u32) {
+                        if c >= ' ' || c == '\t' {
+                            input.push(c);
+                            print!("{}", c);
+                            stdout.flush().ok();
+                        } else if c == '\u{3}' { // Ctrl+C
+                            win_job::SetConsoleMode(h_in, original_mode);
+                            std::process::exit(0);
+                        }
+                    }
+                }
+            }
+        }
+
+        win_job::SetConsoleMode(h_in, original_mode);
+        Some(input.trim().to_string())
+    }
+}
+
+#[cfg(windows)]
+mod win_job {
+    pub type HANDLE = *mut std::ffi::c_void;
+    
+    #[repr(C)]
+    struct IO_COUNTERS {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        basic_limit_information: JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        io_info: IO_COUNTERS,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x00002000;
+    const JobObjectExtendedLimitInformation: i32 = 9;
+    const PROCESS_SET_QUOTA: u32 = 0x0100;
+    const PROCESS_TERMINATE: u32 = 0x0001;
+
+    pub const STD_INPUT_HANDLE: u32 = 0xFFFFFFF6;
+
+    #[repr(C)]
+    pub struct KEY_EVENT_RECORD {
+        pub b_key_down: i32,
+        pub w_repeat_count: u16,
+        pub w_virtual_key_code: u16,
+        pub w_virtual_scan_code: u16,
+        pub u_char: u16,
+        pub dw_control_key_state: u32,
+    }
+
+    #[repr(C)]
+    pub struct INPUT_RECORD {
+        pub event_type: u16,
+        pub _pad: u16,
+        pub key_event: KEY_EVENT_RECORD,
+        pub _more_padding: [u32; 2],
+    }
+
+    extern "system" {
+        fn CreateJobObjectW(lpJobAttributes: *mut std::ffi::c_void, lpName: *const u16) -> HANDLE;
+        fn SetInformationJobObject(
+            hJob: HANDLE,
+            JobObjectInformationClass: i32,
+            lpJobObjectInformation: *mut std::ffi::c_void,
+            cbJobObjectInformation: u32,
+        ) -> i32;
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> HANDLE;
+        fn AssignProcessToJobObject(hJob: HANDLE, hProcess: HANDLE) -> i32;
+        fn CloseHandle(hObject: HANDLE) -> i32;
+
+        pub fn GetStdHandle(nStdHandle: u32) -> HANDLE;
+        pub fn ReadConsoleInputW(
+            hConsoleInput: HANDLE,
+            lpBuffer: *mut INPUT_RECORD,
+            nLength: u32,
+            lpNumberOfEventsRead: *mut u32,
+        ) -> i32;
+        pub fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *mut u32) -> i32;
+        pub fn SetConsoleMode(hConsoleHandle: HANDLE, dwMode: u32) -> i32;
+    }
+
+    static mut JOB_HANDLE: Option<HANDLE> = None;
+
+    pub fn assign_process_to_kill_on_close_job(pid: u32) {
+        unsafe {
+            if JOB_HANDLE.is_none() {
+                let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                if job == std::ptr::null_mut() {
+                    return;
+                }
+                
+                let mut info = std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
+                info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                
+                let res = SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    &mut info as *mut _ as *mut std::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                
+                if res == 0 {
+                    CloseHandle(job);
+                    return;
+                }
+                JOB_HANDLE = Some(job);
+            }
+
+            if let Some(job) = JOB_HANDLE {
+                let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+                if process != std::ptr::null_mut() {
+                    AssignProcessToJobObject(job, process);
+                    CloseHandle(process);
+                }
+            }
+        }
     }
 }
 

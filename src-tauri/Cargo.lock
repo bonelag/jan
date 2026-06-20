@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "Jan"
-version = "0.6.599"
+version = "0.8.3"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6601,7 +6601,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-hardware"
-version = "0.6.599"
+version = "0.8.3"
 dependencies = [
  "ash",
  "libc",
@@ -6642,7 +6642,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-llamacpp"
-version = "0.6.599"
+version = "0.8.3"
 dependencies = [
  "base64 0.22.1",
  "byteorder",
@@ -6689,7 +6689,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-mlx"
-version = "0.6.599"
+version = "0.8.3"
 dependencies = [
  "jan-utils",
  "log",
