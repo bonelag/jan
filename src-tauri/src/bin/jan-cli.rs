@@ -2027,10 +2027,9 @@ fn read_multiline_input() -> Option<String> {
             if record.event_type == 1 && record.key_event.b_key_down != 0 {
                 let key_code = record.key_event.w_virtual_key_code;
                 let unicode_char = record.key_event.u_char;
-                let control_state = record.key_event.dw_control_key_state;
 
-                // SHIFT_PRESSED: 0x0010
-                let is_shift = (control_state & 0x0010) != 0;
+                // Detect shift state directly using user32 GetKeyState
+                let is_shift = win_job::GetKeyState(0x10) < 0;
 
                 if key_code == 0x0D { // Enter
                     if is_shift {
@@ -2156,6 +2155,11 @@ mod win_job {
         ) -> i32;
         pub fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *mut u32) -> i32;
         pub fn SetConsoleMode(hConsoleHandle: HANDLE, dwMode: u32) -> i32;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        pub fn GetKeyState(nVirtKey: i32) -> i16;
     }
 
     static mut JOB_HANDLE: Option<HANDLE> = None;
