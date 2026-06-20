@@ -1433,6 +1433,8 @@ struct TuiRenderer {
     buffering_lang: bool,
     lang_buffer: String,
     buffer: Vec<char>,
+    current_code_block: String,
+    in_thinking: bool,
 }
 
 impl TuiRenderer {
@@ -1446,6 +1448,8 @@ impl TuiRenderer {
             buffering_lang: false,
             lang_buffer: String::new(),
             buffer: Vec::new(),
+            current_code_block: String::new(),
+            in_thinking: false,
         }
     }
 
@@ -1458,6 +1462,49 @@ impl TuiRenderer {
         use console::Style;
         let mut i = 0;
         while i < self.buffer.len() {
+            // Check for opening <think> tag when not thinking
+            if !self.in_thinking && self.buffer[i] == '<' {
+                let think_tag = vec!['<', 't', 'h', 'i', 'n', 'k', '>'];
+                if i + think_tag.len() <= self.buffer.len() {
+                    if self.buffer[i..i + think_tag.len()] == think_tag {
+                        self.in_thinking = true;
+                        i += think_tag.len();
+                        continue;
+                    }
+                } else {
+                    let len = self.buffer.len() - i;
+                    if self.buffer[i..] == think_tag[..len] && !is_final {
+                        break;
+                    }
+                }
+            }
+
+            if self.in_thinking {
+                // Check for closing </think> tag
+                if self.buffer[i] == '<' {
+                    let close_think_tag = vec!['<', '/', 't', 'h', 'i', 'n', 'k', '>'];
+                    if i + close_think_tag.len() <= self.buffer.len() {
+                        if self.buffer[i..i + close_think_tag.len()] == close_think_tag {
+                            self.in_thinking = false;
+                            i += close_think_tag.len();
+                            continue;
+                        }
+                    } else {
+                        let len = self.buffer.len() - i;
+                        if self.buffer[i..] == close_think_tag[..len] && !is_final {
+                            break;
+                        }
+                    }
+                }
+
+                let c = self.buffer[i];
+                i += 1;
+                self.is_line_start = c == '\n';
+                print!("{}", Style::new().dim().italic().apply_to(c));
+                std::io::stdout().flush().ok();
+                continue;
+            }
+
             // Check if we have a backtick
             if self.buffer[i] == '`' {
                 // Lookahead check for code block ```
@@ -1474,7 +1521,22 @@ impl TuiRenderer {
                             self.buffering_lang = true;
                             self.lang_buffer.clear();
                         } else {
-                            print!("\n{}", Style::new().cyan().bold().apply_to("------------------------\n"));
+                            let index = {
+                                let mut idx = 1;
+                                if let Ok(guard) = get_tui_code_blocks().lock() {
+                                    idx = guard.len() + 1;
+                                }
+                                idx
+                            };
+                            
+                            let pad_len = 50;
+                            let border = format!("{}[c {}]", "-".repeat(pad_len), index);
+                            print!("\n{}\n", Style::new().cyan().bold().apply_to(border));
+                            
+                            if let Ok(mut guard) = get_tui_code_blocks().lock() {
+                                guard.push(self.current_code_block.clone());
+                            }
+                            
                             self.is_line_start = true;
                             std::io::stdout().flush().ok();
                         }
@@ -1526,11 +1588,25 @@ impl TuiRenderer {
                     if c == '\n' {
                         self.buffering_lang = false;
                         let lang = self.lang_buffer.trim();
-                        if lang.is_empty() {
-                            print!("\n{}", Style::new().cyan().bold().apply_to("------[code]---------\n"));
+                        let index = {
+                            let mut idx = 1;
+                            if let Ok(guard) = get_tui_code_blocks().lock() {
+                                idx = guard.len() + 1;
+                            }
+                            idx
+                        };
+                        
+                        let lang_part = if lang.is_empty() {
+                            format!("------[code ({index})]")
                         } else {
-                            print!("\n{}", Style::new().cyan().bold().apply_to(format!("------[code - {}]---------\n", lang)));
-                        }
+                            format!("------[code - {} ({index})]", lang)
+                        };
+                        
+                        let pad_len = 50usize.saturating_sub(lang_part.len());
+                        let border = format!("{}{}[c {}]", lang_part, "-".repeat(pad_len), index);
+                        
+                        print!("\n{}\n", Style::new().cyan().bold().apply_to(border));
+                        self.current_code_block.clear();
                     } else {
                         self.lang_buffer.push(c);
                     }
@@ -1540,6 +1616,7 @@ impl TuiRenderer {
 
                 // Render character inside code block directly in cyan
                 print!("{}", Style::new().cyan().apply_to(c));
+                self.current_code_block.push(c);
                 std::io::stdout().flush().ok();
                 continue;
             }
@@ -1670,7 +1747,22 @@ impl TuiRenderer {
         use console::Style;
         self.process_buffer(true);
         if self.in_code_block {
-            print!("\n{}", Style::new().cyan().bold().apply_to("----------------------------\n"));
+            let index = {
+                let mut idx = 1;
+                if let Ok(guard) = get_tui_code_blocks().lock() {
+                    idx = guard.len() + 1;
+                }
+                idx
+            };
+            
+            let pad_len = 50;
+            let border = format!("{}[c {}]", "-".repeat(pad_len), index);
+            print!("\n{}\n", Style::new().cyan().bold().apply_to(border));
+            
+            if let Ok(mut guard) = get_tui_code_blocks().lock() {
+                guard.push(self.current_code_block.clone());
+            }
+            
             self.in_code_block = false;
         }
         // Flush remaining buffer character by character (should be empty but just in case)
@@ -1680,11 +1772,15 @@ impl TuiRenderer {
                 print!("\n");
             } else {
                 let mut style = Style::new();
-                if self.in_bold {
-                    style = style.bold().yellow();
-                }
-                if self.in_inline_code {
-                    style = style.green();
+                if self.in_thinking {
+                    style = style.dim().italic();
+                } else {
+                    if self.in_bold {
+                        style = style.bold().yellow();
+                    }
+                    if self.in_inline_code {
+                        style = style.green();
+                    }
                 }
                 print!("{}", style.apply_to(c));
             }
@@ -1734,7 +1830,7 @@ async fn handle_tui(args: ServeArgs) {
     let ctx_size = if fit { 0 } else { ctx_size_arg };
 
     // Start model server
-    let (pid, actual_port, actual_api_key, _server_state) = start_model_server(
+    let (pid, actual_port, actual_api_key, server_state) = start_model_server(
         &model_id,
         bin,
         port,
@@ -1745,6 +1841,13 @@ async fn handle_tui(args: ServeArgs) {
         verbose,
     )
     .await;
+
+    #[allow(unreachable_patterns)]
+    let is_llamacpp = match &server_state {
+        ActiveServerState::Llama(_) => true,
+        _ => false,
+    };
+    let mut thinking_mode = "auto";
 
     // Set console level to warn if verbose is enabled, to keep terminal clean
     if verbose {
@@ -1774,6 +1877,7 @@ async fn handle_tui(args: ServeArgs) {
     println!("  Special commands:");
     println!("    {} or {}  - Exit chat and shut down server", Style::new().yellow().apply_to("/exit"), Style::new().yellow().apply_to("/quit"));
     println!("    {}            - Clear chat history", Style::new().yellow().apply_to("/clear"));
+    println!("    {}  - Enable/disable/auto model thinking mode (default: auto)", Style::new().yellow().apply_to("/think [on/off/auto]"));
     println!("    {}             - Show this help message", Style::new().yellow().apply_to("/help"));
     println!("  {}", border_style.apply_to("━".repeat(60)));
     println!();
@@ -1849,7 +1953,30 @@ async fn handle_tui(args: ServeArgs) {
 
         if input == "/clear" {
             history.clear();
+            if let Ok(mut guard) = get_tui_code_blocks().lock() {
+                guard.clear();
+            }
             println!("\n  {} Conversation history cleared.\n", Style::new().yellow().apply_to("✓"));
+            continue;
+        }
+
+        if input.starts_with("/think") {
+            let parts: Vec<&str> = input.split_whitespace().collect();
+            if parts.len() > 1 {
+                let mode = parts[1].to_lowercase();
+                if mode == "on" || mode == "off" || mode == "auto" {
+                    thinking_mode = match mode.as_str() {
+                        "on" => "on",
+                        "off" => "off",
+                        _ => "auto",
+                    };
+                    println!("\n  {} Thinking mode set to '{}'.\n", Style::new().green().bold().apply_to("✓"), thinking_mode);
+                } else {
+                    println!("\n  {} Invalid mode '{}'. Usage: /think [on/off/auto]\n", Style::new().red().bold().apply_to("✗"), parts[1]);
+                }
+            } else {
+                println!("\n  Thinking mode is currently: {}\n  Usage: /think [on/off/auto]\n", Style::new().yellow().apply_to(thinking_mode));
+            }
             continue;
         }
 
@@ -1858,8 +1985,50 @@ async fn handle_tui(args: ServeArgs) {
             println!("  Commands:");
             println!("    /exit, /quit - Exit the chat");
             println!("    /clear       - Clear conversation history");
+            println!("    /think [on/off/auto] - Enable/disable/auto model thinking mode");
+            println!("    /c           - Copy the last code block to clipboard");
+            println!("    /c <number>  - Copy the code block with the given index");
             println!("    /help        - Show this help");
             println!();
+            continue;
+        }
+
+        if input.starts_with("/c") || input.starts_with("/copy") {
+            let parts: Vec<&str> = input.split_whitespace().collect();
+            let mut index_to_copy = None;
+            
+            if parts.len() > 1 {
+                if let Ok(idx) = parts[1].parse::<usize>() {
+                    if idx > 0 {
+                        index_to_copy = Some(idx - 1);
+                    }
+                }
+            } else {
+                // Copy the last code block if no index is specified
+                if let Ok(guard) = get_tui_code_blocks().lock() {
+                    if !guard.is_empty() {
+                        index_to_copy = Some(guard.len() - 1);
+                    }
+                }
+            }
+            
+            if let Some(idx) = index_to_copy {
+                let mut text_to_copy = None;
+                if let Ok(guard) = get_tui_code_blocks().lock() {
+                    if idx < guard.len() {
+                        text_to_copy = Some(guard[idx].clone());
+                    }
+                }
+                
+                if let Some(text) = text_to_copy {
+                    copy_to_clipboard(&text);
+                    println!("\n  {} Copied code block {} to clipboard!\n", Style::new().green().bold().apply_to("✓"), idx + 1);
+                } else {
+                    println!("\n  {} Invalid code block index {}.\n", Style::new().red().bold().apply_to("✗"), idx + 1);
+                }
+            } else {
+                println!("\n  {} No code blocks available to copy.\n", Style::new().red().bold().apply_to("✗"));
+            }
             continue;
         }
 
@@ -1871,11 +2040,18 @@ async fn handle_tui(args: ServeArgs) {
 
         // Send request to completions endpoint
         let endpoint = format!("http://127.0.0.1:{}/v1/chat/completions", actual_port);
-        let request_payload = serde_json::json!({
+        let mut request_payload = serde_json::json!({
             "model": model_id,
             "messages": history,
             "stream": true,
         });
+
+        if is_llamacpp && (thinking_mode == "on" || thinking_mode == "off") {
+            let enable_thinking = thinking_mode == "on";
+            request_payload["chat_template_kwargs"] = serde_json::json!({
+                "enable_thinking": enable_thinking
+            });
+        }
 
         // Show a temporary loading indicator
         print!("\n");
@@ -1913,6 +2089,7 @@ async fn handle_tui(args: ServeArgs) {
         let mut buffer = Vec::new();
         let mut assistant_response_text = String::new();
         let mut renderer = TuiRenderer::new();
+        let mut in_thinking = false;
 
         use futures::StreamExt;
         
@@ -1944,9 +2121,31 @@ async fn handle_tui(args: ServeArgs) {
                     if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(data_str) {
                         if let Some(choices) = json_val["choices"].as_array() {
                             if let Some(first_choice) = choices.first() {
+                                if let Some(reasoning) = first_choice["delta"]["reasoning_content"]
+                                    .as_str()
+                                    .or_else(|| first_choice["delta"]["reasoning"].as_str())
+                                {
+                                    if !reasoning.is_empty() {
+                                        if !in_thinking {
+                                            in_thinking = true;
+                                            renderer.render_chunk("<think>\n");
+                                            assistant_response_text.push_str("<think>\n");
+                                        }
+                                        renderer.render_chunk(reasoning);
+                                        assistant_response_text.push_str(reasoning);
+                                    }
+                                }
+
                                 if let Some(delta_content) = first_choice["delta"]["content"].as_str() {
-                                    assistant_response_text.push_str(delta_content);
-                                    renderer.render_chunk(delta_content);
+                                    if !delta_content.is_empty() {
+                                        if in_thinking {
+                                            in_thinking = false;
+                                            renderer.render_chunk("\n</think>\n\n");
+                                            assistant_response_text.push_str("\n</think>\n\n");
+                                        }
+                                        assistant_response_text.push_str(delta_content);
+                                        renderer.render_chunk(delta_content);
+                                    }
                                 }
                             }
                         }
@@ -1965,9 +2164,31 @@ async fn handle_tui(args: ServeArgs) {
                     if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(data_str) {
                         if let Some(choices) = json_val["choices"].as_array() {
                             if let Some(first_choice) = choices.first() {
+                                if let Some(reasoning) = first_choice["delta"]["reasoning_content"]
+                                    .as_str()
+                                    .or_else(|| first_choice["delta"]["reasoning"].as_str())
+                                {
+                                    if !reasoning.is_empty() {
+                                        if !in_thinking {
+                                            in_thinking = true;
+                                            renderer.render_chunk("<think>\n");
+                                            assistant_response_text.push_str("<think>\n");
+                                        }
+                                        renderer.render_chunk(reasoning);
+                                        assistant_response_text.push_str(reasoning);
+                                    }
+                                }
+
                                 if let Some(delta_content) = first_choice["delta"]["content"].as_str() {
-                                    assistant_response_text.push_str(delta_content);
-                                    renderer.render_chunk(delta_content);
+                                    if !delta_content.is_empty() {
+                                        if in_thinking {
+                                            in_thinking = false;
+                                            renderer.render_chunk("\n</think>\n\n");
+                                            assistant_response_text.push_str("\n</think>\n\n");
+                                        }
+                                        assistant_response_text.push_str(delta_content);
+                                        renderer.render_chunk(delta_content);
+                                    }
                                 }
                             }
                         }
@@ -1975,6 +2196,11 @@ async fn handle_tui(args: ServeArgs) {
                 }
             }
             buffer.clear();
+        }
+
+        if in_thinking {
+            renderer.render_chunk("\n</think>\n\n");
+            assistant_response_text.push_str("\n</think>\n\n");
         }
 
         renderer.finish();
@@ -1993,6 +2219,110 @@ async fn handle_tui(args: ServeArgs) {
     kill_process(pid);
 }
 
+use std::sync::{Mutex, OnceLock};
+
+static TUI_CODE_BLOCKS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+fn get_tui_code_blocks() -> &'static Mutex<Vec<String>> {
+    TUI_CODE_BLOCKS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn copy_to_clipboard(text: &str) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let utf16: Vec<u16> = std::ffi::OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+            
+        unsafe {
+            if win_job::OpenClipboard(std::ptr::null_mut()) != 0 {
+                win_job::EmptyClipboard();
+                let size = utf16.len() * 2;
+                let h_mem = win_job::GlobalAlloc(0x0002, size); // GMEM_MOVEABLE = 0x0002
+                if !h_mem.is_null() {
+                    let ptr = win_job::GlobalLock(h_mem);
+                    if !ptr.is_null() {
+                        std::ptr::copy_nonoverlapping(utf16.as_ptr(), ptr as *mut u16, utf16.len());
+                        win_job::GlobalUnlock(h_mem);
+                        win_job::SetClipboardData(13, h_mem); // CF_UNICODETEXT = 13
+                    } else {
+                        win_job::GlobalFree(h_mem);
+                    }
+                }
+                win_job::CloseClipboard();
+            }
+        }
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(mut child) = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(mut child) = std::process::Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        } else if let Ok(mut child) = std::process::Command::new("xsel")
+            .args(["-b", "-i"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
+
+
+
+#[cfg(windows)]
+fn is_paste_waiting(h_in: win_job::HANDLE) -> bool {
+    unsafe {
+        let mut num_events = 0;
+        if win_job::GetNumberOfConsoleInputEvents(h_in, &mut num_events) == 0 || num_events == 0 {
+            return false;
+        }
+
+        let peek_len = std::cmp::min(num_events, 20);
+        let mut buffer = vec![std::mem::zeroed::<win_job::INPUT_RECORD>(); peek_len as usize];
+        let mut read = 0;
+        if win_job::PeekConsoleInputW(h_in, buffer.as_mut_ptr(), peek_len, &mut read) == 0 || read == 0 {
+            return false;
+        }
+
+        for record in buffer.iter().take(read as usize) {
+            if record.event_type == 1 && record.key_event.b_key_down != 0 {
+                let code = record.key_event.w_virtual_key_code;
+                if code != 0x0D && code != 0x10 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 #[cfg(windows)]
 fn read_multiline_input() -> Option<String> {
     use std::io::Write;
@@ -2007,9 +2337,14 @@ fn read_multiline_input() -> Option<String> {
             return None;
         }
 
-        // Enable raw input mode (disable line input and echo input)
-        // We keep processed input so Ctrl+C is still handled or we catch it
-        let raw_mode = (original_mode & !0x0002 & !0x0004) | 0x0001;
+        // Enable raw input mode (disable line input, echo input, and mouse input; keep quick edit enabled)
+        // ENABLE_LINE_INPUT: 0x0002
+        // ENABLE_ECHO_INPUT: 0x0004
+        // ENABLE_MOUSE_INPUT: 0x0010
+        // ENABLE_QUICK_EDIT_MODE: 0x0040
+        // ENABLE_EXTENDED_FLAGS: 0x0080
+        // ENABLE_PROCESSED_INPUT: 0x0001
+        let raw_mode = (original_mode & !0x0002 & !0x0004 & !0x0010) | 0x0001 | 0x0080;
         if win_job::SetConsoleMode(h_in, raw_mode) == 0 {
             return None;
         }
@@ -2032,7 +2367,8 @@ fn read_multiline_input() -> Option<String> {
                 let is_shift = win_job::GetKeyState(0x10) < 0;
 
                 if key_code == 0x0D { // Enter
-                    if is_shift {
+                    let is_paste = is_paste_waiting(h_in);
+                    if is_shift || is_paste {
                         input.push('\n');
                         print!("\n");
                         stdout.flush().ok();
@@ -2117,6 +2453,7 @@ mod win_job {
     pub const STD_INPUT_HANDLE: u32 = 0xFFFFFFF6;
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
     pub struct KEY_EVENT_RECORD {
         pub b_key_down: i32,
         pub w_repeat_count: u16,
@@ -2127,6 +2464,7 @@ mod win_job {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
     pub struct INPUT_RECORD {
         pub event_type: u16,
         pub _pad: u16,
@@ -2155,12 +2493,35 @@ mod win_job {
         ) -> i32;
         pub fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *mut u32) -> i32;
         pub fn SetConsoleMode(hConsoleHandle: HANDLE, dwMode: u32) -> i32;
+        
+        pub fn GetNumberOfConsoleInputEvents(hConsoleInput: HANDLE, lpcNumberOfEvents: *mut u32) -> i32;
+        pub fn PeekConsoleInputW(
+            hConsoleInput: HANDLE,
+            lpBuffer: *mut INPUT_RECORD,
+            nLength: u32,
+            lpNumberOfEventsRead: *mut u32,
+        ) -> i32;
     }
 
     #[link(name = "user32")]
     extern "system" {
         pub fn GetKeyState(nVirtKey: i32) -> i16;
+        
+        pub fn OpenClipboard(hWndNewOwner: HANDLE) -> i32;
+        pub fn CloseClipboard() -> i32;
+        pub fn EmptyClipboard() -> i32;
+        pub fn SetClipboardData(uFormat: u32, hMem: HANDLE) -> HANDLE;
     }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn GlobalAlloc(uFlags: u32, dwBytes: usize) -> HANDLE;
+        pub fn GlobalLock(hMem: HANDLE) -> HANDLE;
+        pub fn GlobalUnlock(hMem: HANDLE) -> i32;
+        pub fn GlobalFree(hMem: HANDLE) -> HANDLE;
+    }
+
+
 
     static mut JOB_HANDLE: Option<HANDLE> = None;
 

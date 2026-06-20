@@ -12,7 +12,7 @@ taskkill /IM llama-server.exe /F /T >nul 2>&1
 
 :: 2. Initialize MSVC toolchain
 echo Initializing Visual Studio compiler environment...
-call "D:\VisualStudio\VC\Auxiliary\Build\vcvarsall.bat" x64
+call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
 
 :: 3. Run cargo build inside src-tauri folder
 echo Building release binary...
